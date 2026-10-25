@@ -84,6 +84,14 @@ func (h *Handler) GetAssertion(ctx context.Context, req *GetAssertionRequest) (b
 		matchedCredentials = validCredentials
 	}
 
+	// up=false naming a credential is a silent check (Firefox pre-flight, OpenSSH
+	// key selection): no fingerprint, no UP/UV flag (RPs and sshd refuse such an
+	// assertion as a login), no extensions so PRF output still needs the finger.
+	if up, ok := req.Options["up"]; ok && !up && matchedFromAllowList != nil {
+		log.Printf("CTAP2 GetAssertion: silent check (up=false), no fingerprint")
+		return h.buildNonResidentAssertionResponse(ctx, matchedFromAllowList, rpIDHash, req.ClientDataHash, nil, 0)
+	}
+
 	// Request user presence
 	var challengeParam, appParam [32]byte
 	copy(challengeParam[:], req.ClientDataHash)
@@ -113,7 +121,7 @@ func (h *Handler) GetAssertion(ctx context.Context, req *GetAssertionRequest) (b
 	// Handle the two different paths for response building
 	if matchedFromAllowList != nil {
 		// Non-resident credential path - use the old behavior
-		return h.buildNonResidentAssertionResponse(ctx, matchedFromAllowList, rpIDHash, req.ClientDataHash, req.Extensions)
+		return h.buildNonResidentAssertionResponse(ctx, matchedFromAllowList, rpIDHash, req.ClientDataHash, req.Extensions, FlagUserPresent|FlagUserVerified)
 	}
 
 	// Resident credential path
@@ -133,7 +141,7 @@ func (h *Handler) GetAssertion(ctx context.Context, req *GetAssertionRequest) (b
 }
 
 // buildNonResidentAssertionResponse builds a response for non-resident (server-side) credentials
-func (h *Handler) buildNonResidentAssertionResponse(ctx context.Context, cred *PublicKeyCredentialDescriptor, rpIDHash [32]byte, clientDataHash []byte, extensions map[string]interface{}) (byte, []byte) {
+func (h *Handler) buildNonResidentAssertionResponse(ctx context.Context, cred *PublicKeyCredentialDescriptor, rpIDHash [32]byte, clientDataHash []byte, extensions map[string]interface{}, flags byte) (byte, []byte) {
 	// Process hmac-secret extension if present
 	var extensionsOutput []byte
 	log.Printf("CTAP2 GetAssertion: Extensions=%+v", extensions)
@@ -154,7 +162,6 @@ func (h *Handler) buildNonResidentAssertionResponse(ctx context.Context, cred *P
 	}
 
 	// Build flags
-	flags := byte(FlagUserPresent | FlagUserVerified)
 	if len(extensionsOutput) > 0 {
 		flags |= FlagExtensionData
 	}
