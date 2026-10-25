@@ -25,6 +25,7 @@ var (
 
 type TPM struct {
 	devicePath string
+	master     []byte
 	mu         sync.Mutex
 }
 
@@ -32,9 +33,16 @@ func (t *TPM) open() (io.ReadWriteCloser, error) {
 	return tpm2.OpenTPM(t.devicePath)
 }
 
-func New(devicePath string) (*TPM, error) {
+// New takes the master secret (at least 32 bytes) that systemd unseals only
+// when the boot PCRs match; every key's TPM password is derived from it.
+func New(devicePath string, master []byte) (*TPM, error) {
+	if len(master) < 32 {
+		return nil, fmt.Errorf("master secret must be at least 32 bytes, got %d", len(master))
+	}
+
 	t := &TPM{
 		devicePath: devicePath,
+		master:     master,
 	}
 
 	tpm, err := t.open()
@@ -44,6 +52,15 @@ func New(devicePath string) (*TPM, error) {
 	tpm.Close()
 
 	return t, nil
+}
+
+// keyAuth is a credential key's TPM password: the credential ID alone (which
+// the RP stores) is useless without the master secret, whatever OS is booted.
+func (t *TPM) keyAuth(seed []byte) string {
+	mac := hmac.New(sha256.New, t.master)
+	mac.Write([]byte("tpm-fido-key-auth"))
+	mac.Write(seed)
+	return string(mac.Sum(nil))
 }
 
 func primaryKeyTmpl(seed, applicationParam []byte) tpm2.Public {
@@ -102,12 +119,14 @@ func (t *TPM) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, 
 
 	primaryTmpl := primaryKeyTmpl(randSeed, applicationParam)
 
+	// NoDA: a 256-bit password needs no anti-hammering, and a wrong master
+	// secret must not lock out the whole TPM.
 	childTmpl := tpm2.Public{
 		Type:    tpm2.AlgECC,
 		NameAlg: tpm2.AlgSHA256,
 		Attributes: tpm2.FlagFixedTPM | tpm2.FlagFixedParent |
 			tpm2.FlagSensitiveDataOrigin | tpm2.FlagUserWithAuth |
-			tpm2.FlagSign,
+			tpm2.FlagNoDA | tpm2.FlagSign,
 		ECCParameters: &tpm2.ECCParams{
 
 			Sign: &tpm2.SigScheme{
@@ -129,7 +148,7 @@ func (t *TPM) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, 
 
 	defer tpm2.FlushContext(tpm, parentHandle)
 
-	private, public, _, _, _, err := tpm2.CreateKey(tpm, parentHandle, tpm2.PCRSelection{}, "", "", childTmpl)
+	private, public, _, _, _, err := tpm2.CreateKey(tpm, parentHandle, tpm2.PCRSelection{}, "", t.keyAuth(randSeed), childTmpl)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("CreateKey (child) err: %w", err)
 	}
@@ -160,7 +179,7 @@ func (t *TPM) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, 
 }
 
 // DeriveCredRandom derives a credential-specific random value for hmac-secret extension
-// Extracts the seed from the keyHandle and uses HMAC-SHA256(seed, "credential-random")
+// Extracts the seed from the keyHandle and uses HMAC-SHA256(master, "credential-random" || seed)
 func (t *TPM) DeriveCredRandom(keyHandle []byte) ([]byte, error) {
 	dec := lencode.NewDecoder(bytes.NewReader(keyHandle), lencode.SeparatorOpt(separator))
 
@@ -182,9 +201,10 @@ func (t *TPM) DeriveCredRandom(keyHandle []byte) ([]byte, error) {
 		return nil, fmt.Errorf("invalid key handle: missing seed")
 	}
 
-	// Derive credential random using HMAC-SHA256(seed, "credential-random")
-	mac := hmac.New(sha256.New, seed)
+	// Keyed by the master secret: the seed is in the credential ID, which the RP knows.
+	mac := hmac.New(sha256.New, t.master)
 	mac.Write([]byte("credential-random"))
+	mac.Write(seed)
 	return mac.Sum(nil), nil
 }
 
@@ -243,7 +263,7 @@ func (t *TPM) SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, erro
 		Hash: tpm2.AlgSHA256,
 	}
 
-	sig, err := tpm2.Sign(tpm, key, "", digest[:], nil, scheme)
+	sig, err := tpm2.Sign(tpm, key, t.keyAuth(seed), digest[:], nil, scheme)
 	if err != nil {
 		return nil, fmt.Errorf("sign err: %w", err)
 	}

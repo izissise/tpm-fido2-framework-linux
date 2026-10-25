@@ -29,6 +29,7 @@ var (
 	mode     = flag.String("mode", "native", "Operating mode: native (Chrome extension) or daemon (virtual HID device)")
 	showTray   = flag.Bool("tray", false, "Show system tray icon for toggling the virtual device (daemon mode only)")
 	autoSwitch = flag.Bool("auto-switch", true, "Automatically disable virtual key when a YubiKey is plugged in (tray mode only)")
+	fprintUser = flag.String("fprint-user", "", "User whose fingerprint confirms requests (default: the user running the daemon)")
 )
 
 func main() {
@@ -46,7 +47,13 @@ func main() {
 
 	switch *backend {
 	case "tpm":
-		signer, err = tpm.New(*device)
+		// systemd provides the master secret only if the TPM unseals it, i.e. the boot PCRs match
+		var master []byte
+		master, err = os.ReadFile(os.Getenv("CREDENTIALS_DIRECTORY") + "/master")
+		if err != nil {
+			log.Fatalf("Failed to read master secret credential: %v", err)
+		}
+		signer, err = tpm.New(*device, master)
 		if err != nil {
 			log.Fatalf("Failed to initialize TPM backend: %v", err)
 		}
@@ -62,7 +69,7 @@ func main() {
 	}
 
 	// Initialize user presence handler
-	presence := userpresence.New()
+	presence := userpresence.New(*fprintUser)
 	log.Printf("User presence handler initialized")
 
 	// Initialize credential storage for resident keys

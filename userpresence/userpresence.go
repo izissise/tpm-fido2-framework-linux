@@ -12,6 +12,7 @@ import (
 
 // UserPresence handles user presence confirmation via fingerprint reader
 type UserPresence struct {
+	user          string
 	mu            sync.Mutex
 	activeRequest *request
 }
@@ -30,9 +31,10 @@ type Result struct {
 	Error error
 }
 
-// New creates a new UserPresence handler
-func New() *UserPresence {
-	return &UserPresence{}
+// New creates a new UserPresence handler checking user's fingerprint
+// (empty: the user running the daemon)
+func New(user string) *UserPresence {
+	return &UserPresence{user: user}
 }
 
 // ConfirmPresence requests user presence confirmation via fingerprint
@@ -90,17 +92,13 @@ func (up *UserPresence) promptFingerprint(req *request, prompt string) {
 
 	log.Printf("userpresence: prompt=%s", prompt)
 
-	// Send notification to user (non-blocking)
-	notifyCmd := exec.Command("notify-send", "-u", "critical", "-t", "30000",
-		"TPM-FIDO", prompt+"\n\nTouch fingerprint sensor to confirm.")
-	if err := notifyCmd.Start(); err != nil {
-		log.Printf("userpresence: notify-send failed to start: %v", err)
-		// Continue anyway - fingerprint verification is the important part
-	}
-
-	// Run fprintd-verify with context timeout
+	// Run fprintd-verify with context timeout; without -f it only accepts the first enrolled finger
 	log.Printf("userpresence: launching fprintd-verify")
-	fprintCmd := exec.CommandContext(ctx, "fprintd-verify")
+	args := []string{"-f", "any"}
+	if up.user != "" {
+		args = append(args, up.user)
+	}
+	fprintCmd := exec.CommandContext(ctx, "fprintd-verify", args...)
 	fprintCmd.Stdout = os.Stderr // Must not use stdout - Native Messaging uses it
 	fprintCmd.Stderr = os.Stderr
 
