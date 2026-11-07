@@ -10,6 +10,9 @@ import (
 	"time"
 )
 
+// maxTouches caps fingerprint attempts per request, all within its 30 s
+const maxTouches = 6
+
 // UserPresence handles user presence confirmation via fingerprint reader
 type UserPresence struct {
 	user          string
@@ -98,11 +101,18 @@ func (up *UserPresence) promptFingerprint(req *request, prompt string) {
 	if up.user != "" {
 		args = append(args, up.user)
 	}
-	fprintCmd := exec.CommandContext(ctx, "fprintd-verify", args...)
-	fprintCmd.Stdout = os.Stderr // Must not use stdout - Native Messaging uses it
-	fprintCmd.Stderr = os.Stderr
-
-	err := fprintCmd.Run()
+	// fprintd-verify gives up at the first "no match": allow up to maxTouches tries
+	var err error
+	for try := 1; ; try++ {
+		fprintCmd := exec.CommandContext(ctx, "fprintd-verify", args...)
+		fprintCmd.Stdout = os.Stderr // Must not use stdout - Native Messaging uses it
+		fprintCmd.Stderr = os.Stderr
+		err = fprintCmd.Run()
+		if err == nil || try == maxTouches || ctx.Err() != nil {
+			break
+		}
+		log.Printf("userpresence: fprintd-verify failed: %v; try %d of %d", err, try+1, maxTouches)
+	}
 	if err != nil {
 		log.Printf("userpresence: fprintd-verify failed: %v", err)
 		if ctx.Err() == context.DeadlineExceeded {

@@ -393,46 +393,48 @@ func (d *Device) handleCBOR(cid uint32, data []byte) {
 	d.mu.Unlock()
 
 	// Run HandleCommand in a goroutine; send keepalives while it blocks
-	type result struct {
-		status byte
-		resp   []byte
-	}
-	resultCh := make(chan result, 1)
+	resultCh := make(chan cborResult, 1)
 
 	go func() {
 		status, resp := d.handler.HandleCommand(ctx, ctapCmd, ctapData)
-		resultCh <- result{status, resp}
+		resultCh <- cborResult{status, resp}
 	}()
 
+	if r, ok := awaitResult(ctx, resultCh, func() { d.sendKeepalive(cid, keepaliveProcessing) }); ok {
+		// CTAPHID_CBOR response: [status_byte][cbor_data...]
+		d.sendResponse(cid, cmdCBOR, append([]byte{r.status}, r.resp...))
+	}
+
+	d.mu.Lock()
+	if ch, ok := d.channels[cid]; ok {
+		ch.cancelFunc = nil
+	}
+	d.mu.Unlock()
+}
+
+type cborResult struct {
+	status byte
+	resp   []byte
+}
+
+// awaitResult waits for the handler's answer, calling keepalive meanwhile.
+// A cancelled request gets no answer. A timed-out one still does: libfido2
+// (so ssh) has no timeout of its own and would wait forever.
+func awaitResult(ctx context.Context, resultCh <-chan cborResult, keepalive func()) (cborResult, bool) {
 	ticker := time.NewTicker(keepaliveInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case r := <-resultCh:
-			// CTAPHID_CBOR response: [status_byte][cbor_data...]
-			resp := make([]byte, 1+len(r.resp))
-			resp[0] = r.status
-			copy(resp[1:], r.resp)
-			d.sendResponse(cid, cmdCBOR, resp)
-
-			d.mu.Lock()
-			if ch, ok := d.channels[cid]; ok {
-				ch.cancelFunc = nil
-			}
-			d.mu.Unlock()
-			return
-
+			return r, true
 		case <-ticker.C:
-			d.sendKeepalive(cid, keepaliveProcessing)
-
+			keepalive()
 		case <-ctx.Done():
-			d.mu.Lock()
-			if ch, ok := d.channels[cid]; ok {
-				ch.cancelFunc = nil
+			if ctx.Err() != context.DeadlineExceeded {
+				return cborResult{}, false
 			}
-			d.mu.Unlock()
-			return
+			return <-resultCh, true // handlers return as soon as ctx is done
 		}
 	}
 }
